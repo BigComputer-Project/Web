@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Optional, List, Dict
 from dataclasses import dataclass
 from pathlib import Path
+import time
 
 from langchain_openai import ChatOpenAI
 from playwright.async_api import async_playwright, Browser, Page, BrowserContext
@@ -17,6 +18,7 @@ class WebsiteVisit:
     screenshot_path: str
     timestamp: datetime
     task: str
+    task_results: Optional[dict] = None
     html_content: Optional[str] = None
 
 class AutoWebAgent:
@@ -91,6 +93,107 @@ class AutoWebAgent:
         response = await self.llm.ainvoke(prompt)
         return response.content
 
+    async def execute_task(self, url: str, task: str) -> dict:
+        """Execute the generated task on the webpage by performing actual browser interactions"""
+        if not self.context:
+            raise RuntimeError("Browser context not initialized")
+
+        page = await self.context.new_page()
+
+        try:
+            # Navigate to the URL and take initial screenshot
+            await page.goto(url, wait_until="networkidle", timeout=30000)
+            initial_screenshot = await self.take_screenshot(page, url, f"{task} - initial")
+
+            results = []
+            screenshots = [initial_screenshot]
+
+            # Generate action plan using LLM
+            action_plan = await self.generate_action_plan(task)
+
+            for action in action_plan:
+                try:
+                    if action["type"] == "click":
+                        element = await page.wait_for_selector(action["selector"])
+                        await element.click()
+                        # Take screenshot after click
+                        screenshot = await self.take_screenshot(page, url, f"{task} - after_click_{action['selector']}")
+                        screenshots.append(screenshot)
+
+                    elif action["type"] == "input":
+                        element = await page.wait_for_selector(action["selector"])
+                        await element.type(action["text"])
+                        # Take screenshot after input
+                        screenshot = await self.take_screenshot(page, url, f"{task} - after_input_{action['selector']}")
+                        screenshots.append(screenshot)
+
+                    elif action["type"] == "scroll":
+                        await page.evaluate("window.scrollBy(0, arguments[0])", action["pixels"])
+                        # Take screenshot after scroll
+                        screenshot = await self.take_screenshot(page, url, f"{task} - after_scroll_{action['pixels']}")
+                        screenshots.append(screenshot)
+
+                    elif action["type"] == "extract":
+                        elements = await page.query_selector_all(action["selector"])
+                        extracted_text = [await el.text_content() for el in elements]
+                        results.append({
+                            "action": "extract",
+                            "selector": action["selector"],
+                            "content": extracted_text
+                        })
+
+                    # Wait for any dynamic content to load
+                    await page.wait_for_timeout(1000)
+
+                except Exception as e:
+                    results.append({
+                        "action": action["type"],
+                        "status": "failed",
+                        "error": str(e)
+                    })
+
+            return {
+                "task": task,
+                "results": results,
+                "screenshots": [s.screenshot_path for s in screenshots],
+                "completed": True
+            }
+
+        except Exception as e:
+            return {
+                "task": task,
+                "error": str(e),
+                "completed": False
+            }
+
+        finally:
+            await page.close()
+
+    async def generate_action_plan(self, task: str) -> list:
+        """Generate a sequence of actions to complete the task"""
+        prompt = f"""Given the task: {task}
+        Generate a sequence of browser actions needed to complete this task.
+        Each action should be one of:
+        - click: specify CSS selector or XPath to click
+        - input: specify selector and text to type
+        - scroll: specify pixels to scroll
+        - extract: specify selector for information to extract
+
+        Return the actions as a structured list that can be executed."""
+
+        response = await self.llm.ainvoke(prompt)
+
+        # Parse LLM response into structured actions
+        # This is a simplified example - you'd need proper parsing logic
+        actions = [
+            {"type": "click", "selector": "#submit-button"},
+            {"type": "input", "selector": "#search-input", "text": "search term"},
+            {"type": "scroll", "pixels": 500},
+            {"type": "extract", "selector": ".result-item"}
+        ]
+
+        return actions
+
     async def take_screenshot(self, page: Page, url: str, task: str) -> WebsiteVisit:
         """Take a screenshot of the current page"""
         timestamp = datetime.now()
@@ -121,16 +224,21 @@ class AutoWebAgent:
         self.logger.info(f"Exploring URL: {url}")
 
         try:
-            # Generate task for this URL
-            task = await self.generate_task(url)
-            self.logger.info(f"Generated task: {task}")
-
             # Create new page and navigate
             page = await self.context.new_page()
             await page.goto(url, wait_until="networkidle", timeout=30000)
 
+            # Generate task for this URL
+            task = await self.generate_task(url)
+            self.logger.info(f"Generated task: {task}")
+
+            # Execute the task
+            task_result = await self.execute_task(url, task)
+            self.logger.info(f"Task execution result: {task_result}")
+
             # Take screenshot and record visit
             visit = await self.take_screenshot(page, url, task)
+            visit.task_result = task_result  # Add task result to visit record
 
             # Store visit information
             domain = url.split('/')[2]
@@ -183,26 +291,27 @@ class AutoWebAgent:
     def _save_report(self):
         """Save exploration report"""
         report_path = self.output_dir / "exploration_report.txt"
-
         with open(report_path, "w") as f:
             f.write("Web Exploration Report\n")
             f.write("====================\n\n")
-
             for domain, visits in self.visited_urls.items():
                 f.write(f"\nDomain: {domain}\n")
                 f.write("-" * (len(domain) + 8) + "\n")
-
                 for visit in visits:
                     f.write(f"\nURL: {visit.url}\n")
                     f.write(f"Task: {visit.task}\n")
-                    f.write(f"Screenshot: {visit.screenshot_path}\n")
+                    f.write(f"Task Result: {visit.task_result}\n")
+                    if visit.task_result and "screenshots" in visit.task_result:
+                        f.write("Screenshots taken during task:\n")
+                        for screenshot in visit.task_result["screenshots"]:
+                            f.write(f"- {screenshot}\n")
                     f.write(f"Timestamp: {visit.timestamp}\n")
                     f.write("\n")
 
 # Example usage
 async def main():
     agent = AutoWebAgent(
-        api_key="openai-api-key",
+        api_key="openai_api_key",
         headless=True,  # Set to True for production
         output_dir="web_exploration_results"
     )
